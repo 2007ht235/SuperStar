@@ -618,16 +618,16 @@ class SiliconFlow(Tiku):
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
         self.min_interval = int(self._conf.get('min_interval_seconds', 3))
 
-# ------------------------ 新增：豆包大模型题库类 ------------------------
+# ------------------------ 豆包大模型题库类（适配火山方舟） ------------------------
 class Doubao(Tiku):
-    """豆包大模型答题实现（兼容Tiku父类接口）"""
+    """豆包大模型答题实现（适配火山方舟的豆包1.5 Pro 32K接口）"""
     def __init__(self) -> None:
         super().__init__()
-        self.name = '豆包大模型'
+        self.name = '豆包1.5 Pro 32K（火山方舟）'
         self.last_request_time = None  # 记录最后一次请求时间，防止频率超限
 
     def _query(self, q_info: dict):
-        """核心：调用豆包API查询题目答案"""
+        """核心：调用火山方舟的豆包API查询题目答案"""
         # 工具函数：清理大模型输出的多余格式（比如```json包裹）
         def clean_response(content):
             pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
@@ -640,32 +640,33 @@ class Doubao(Tiku):
         q_options = q_info.get('options', '')  # 选项可能为空（如填空题）
         full_question = f"题目：{q_title}\n选项：{q_options}" if q_options else f"题目：{q_title}"
 
-        # 2. 构造豆包API的系统提示词（按题目类型定制）
+        # 2. 构造豆包API的系统提示词（按题目类型定制，更精简）
         system_prompt = ""
         if q_type == "single":
-            system_prompt = "本题为单选题，你只能选择一个正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回，示例：{\"Answer\": [\"正确选项内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+            system_prompt = "本题为单选题，仅选择一个正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回：{\"Answer\": [\"正确选项内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
         elif q_type == "multiple":
-            system_prompt = "本题为多选题，你必须选择所有正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回，示例：{\"Answer\": [\"选项1\", \"选项2\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+            system_prompt = "本题为多选题，选择所有正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回：{\"Answer\": [\"选项1\", \"选项2\"]}。禁止输出任何多余解释、MD语法或参考资料。"
         elif q_type == "completion":
-            system_prompt = "本题为填空题，直接给出正确答案，以JSON格式返回，示例：{\"Answer\": [\"答案内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+            system_prompt = "本题为填空题，直接给出正确答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
         elif q_type == "judgement":
-            system_prompt = "本题为判断题，只能回答“正确”或“错误”，以JSON格式返回，示例：{\"Answer\": [\"正确\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+            system_prompt = "本题为判断题，仅回答“正确”或“错误”，以JSON格式返回：{\"Answer\": [\"正确\"]}。禁止输出任何多余解释、MD语法或参考资料。"
         else:
-            system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回，示例：{\"Answer\": [\"答案内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+            system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
 
-        # 3. 构造豆包API请求参数
+        # 3. 构造火山方舟API请求参数
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"  # 豆包API密钥
+            "Authorization": f"Bearer {self.api_key}"  # 火山方舟的API密钥
         }
         payload = {
-            "model": self.model,  # 豆包模型（如doubao-pro）
+            "model": self.model,  # 火山方舟的豆包模型名
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": full_question}
             ],
             "temperature": 0.1,  # 低随机性，保证答案稳定
-            "max_tokens": 1024
+            "max_tokens": 1024,
+            "stream": False  # 非流式输出
         }
 
         # 4. 处理请求频率限制（避免API超限）
@@ -677,7 +678,7 @@ class Doubao(Tiku):
                 time.sleep(sleep_time)
         self.last_request_time = time.time()
 
-        # 5. 调用豆包API并解析结果
+        # 5. 调用火山方舟的豆包API并解析结果
         try:
             response = requests.post(
                 url=self.api_endpoint,
@@ -703,7 +704,7 @@ class Doubao(Tiku):
             return "\n".join(answer_list).strip()
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"豆包API请求失败：{str(e)}")
+            logger.error(f"豆包API请求失败：{str(e)}，响应内容：{response.text if 'response' in locals() else '无'}")
         except json.JSONDecodeError as e:
             logger.error(f"豆包返回内容解析失败：{str(e)}，原始内容：{content}")
         except Exception as e:
@@ -712,9 +713,9 @@ class Doubao(Tiku):
         return None
 
     def _init_tiku(self):
-        """从config.ini加载豆包配置"""
+        """从config.ini加载火山方舟的豆包配置"""
         # 从[tiku]配置中读取参数
-        self.api_endpoint = self._conf.get('doubao_endpoint', 'https://api.doubao.com/v1/chat/completions')
-        self.api_key = self._conf['doubao_api_key']  # 必填：豆包API密钥
-        self.model = self._conf.get('doubao_model', 'doubao-pro')  # 豆包模型
+        self.api_endpoint = self._conf.get('doubao_endpoint', 'https://ark.cn-beijing.volces.com/api/v3/chat/completions')
+        self.api_key = self._conf['doubao_api_key']  # 火山方舟的API密钥
+        self.model = self._conf.get('doubao_model', 'doubao-1-5-pro-32k-250115')  # 火山方舟的豆包模型名
         self.min_interval = int(self._conf.get('doubao_min_interval', 1))  # 请求间隔（秒）
