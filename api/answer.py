@@ -122,6 +122,7 @@ class Tiku:
             logger.info("未找到tiku配置, 已忽略题库功能")
             self.DISABLE = True
             return None
+
     def query(self,q_info:dict):
         if self.DISABLE:
             return None
@@ -530,6 +531,7 @@ class AI(Tiku):
         self.model = self._conf['model']
         self.http_proxy = self._conf['http_proxy']
         self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+
 class SiliconFlow(Tiku):
     """硅基流动大模型答题实现"""
     def __init__(self):
@@ -575,9 +577,7 @@ class SiliconFlow(Tiku):
                 }
             ],
             "stream": False,
-
             "max_tokens": 4096,
-
             "temperature": 0.7,
             "top_p": 0.7,
             "response_format": {"type": "text"}
@@ -615,8 +615,106 @@ class SiliconFlow(Tiku):
         # 从配置文件读取参数
         self.api_endpoint = self._conf.get('siliconflow_endpoint', 'https://api.siliconflow.cn/v1/chat/completions')
         self.api_key = self._conf['siliconflow_key']
-
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
-
-
         self.min_interval = int(self._conf.get('min_interval_seconds', 3))
+
+# ------------------------ 新增：豆包大模型题库类 ------------------------
+class Doubao(Tiku):
+    """豆包大模型答题实现（兼容Tiku父类接口）"""
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = '豆包大模型'
+        self.last_request_time = None  # 记录最后一次请求时间，防止频率超限
+
+    def _query(self, q_info: dict):
+        """核心：调用豆包API查询题目答案"""
+        # 工具函数：清理大模型输出的多余格式（比如```json包裹）
+        def clean_response(content):
+            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
+            match = re.search(pattern, content, re.DOTALL)
+            return match.group(1).strip() if match else content.strip()
+
+        # 1. 构造题目信息（类型+题干+选项）
+        q_type = q_info['type']  # single/multiple/completion/judgement
+        q_title = q_info['title']
+        q_options = q_info.get('options', '')  # 选项可能为空（如填空题）
+        full_question = f"题目：{q_title}\n选项：{q_options}" if q_options else f"题目：{q_title}"
+
+        # 2. 构造豆包API的系统提示词（按题目类型定制）
+        system_prompt = ""
+        if q_type == "single":
+            system_prompt = "本题为单选题，你只能选择一个正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回，示例：{\"Answer\": [\"正确选项内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+        elif q_type == "multiple":
+            system_prompt = "本题为多选题，你必须选择所有正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回，示例：{\"Answer\": [\"选项1\", \"选项2\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+        elif q_type == "completion":
+            system_prompt = "本题为填空题，直接给出正确答案，以JSON格式返回，示例：{\"Answer\": [\"答案内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+        elif q_type == "judgement":
+            system_prompt = "本题为判断题，只能回答“正确”或“错误”，以JSON格式返回，示例：{\"Answer\": [\"正确\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+        else:
+            system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回，示例：{\"Answer\": [\"答案内容\"]}。禁止输出多余解释、MD语法或搜索参考资料。"
+
+        # 3. 构造豆包API请求参数
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"  # 豆包API密钥
+        }
+        payload = {
+            "model": self.model,  # 豆包模型（如doubao-pro）
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": full_question}
+            ],
+            "temperature": 0.1,  # 低随机性，保证答案稳定
+            "max_tokens": 1024
+        }
+
+        # 4. 处理请求频率限制（避免API超限）
+        if self.last_request_time:
+            interval = time.time() - self.last_request_time
+            if interval < self.min_interval:
+                sleep_time = self.min_interval - interval
+                logger.debug(f"豆包API请求间隔过短，等待{sleep_time:.2f}秒")
+                time.sleep(sleep_time)
+        self.last_request_time = time.time()
+
+        # 5. 调用豆包API并解析结果
+        try:
+            response = requests.post(
+                url=self.api_endpoint,
+                headers=headers,
+                json=payload,
+                verify=False,
+                timeout=30
+            )
+            response.raise_for_status()  # 抛出HTTP错误（如401、429）
+            res_json = response.json()
+
+            # 解析返回的答案
+            content = res_json['choices'][0]['message']['content']
+            cleaned_content = clean_response(content)
+            answer_json = json.loads(cleaned_content)
+            answer_list = answer_json.get('Answer', [])
+
+            if not answer_list:
+                logger.error("豆包返回的答案为空")
+                return None
+
+            # 拼接答案（兼容原有逻辑的字符串格式）
+            return "\n".join(answer_list).strip()
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"豆包API请求失败：{str(e)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"豆包返回内容解析失败：{str(e)}，原始内容：{content}")
+        except Exception as e:
+            logger.error(f"豆包答题逻辑异常：{str(e)}")
+
+        return None
+
+    def _init_tiku(self):
+        """从config.ini加载豆包配置"""
+        # 从[tiku]配置中读取参数
+        self.api_endpoint = self._conf.get('doubao_endpoint', 'https://api.doubao.com/v1/chat/completions')
+        self.api_key = self._conf['doubao_api_key']  # 必填：豆包API密钥
+        self.model = self._conf.get('doubao_model', 'doubao-pro')  # 豆包模型
+        self.min_interval = int(self._conf.get('doubao_min_interval', 1))  # 请求间隔（秒）
