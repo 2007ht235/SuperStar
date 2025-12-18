@@ -25,5 +25,5 @@ jobs:
           
       
       - name: Run main.py
-        run: python main.py -u 15080621505 -p 2007Ht135. -l 259096010
+        run: python main.py -u 13975055921 -p xxx211211 -l 259096010
 
