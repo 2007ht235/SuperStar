@@ -11,14 +11,8 @@ import requests
 from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
-# 假设你原有的模块导入正常
-# from api.answer_check import *
-# from api.logger import logger
-
-# 临时定义logger（如果你的项目中有实际logger，可删除此段）
-import logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+from api.answer_check import *
+from api.logger import logger
 
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
@@ -151,7 +145,6 @@ class Tiku:
                 answer = answer.strip()
                 cache_dao.add_cache(q_info['title'], answer)
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-                # 假设check_answer是你原有校验函数，若不存在可注释此判断
                 if check_answer(answer, q_info['type'], self):
                     return answer
                 else:
@@ -435,27 +428,16 @@ class AI(Tiku):
             match = re.search(pattern, md_str, re.DOTALL)
             return match.group(1).strip() if match else md_str.strip()
         
-        # 处理请求间隔（移到API调用前）
-        if self.last_request_time:
-            interval_time = time.time() - self.last_request_time
-            if interval_time < self.min_interval_seconds:
-                sleep_time = self.min_interval_seconds - interval_time
-                logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
-                time.sleep(sleep_time)
-        
-        # 初始化客户端
         if self.http_proxy:
             proxy = self.http_proxy
             httpx_client = httpx.Client(proxy=proxy)
             client = OpenAI(http_client=httpx_client, base_url = self.endpoint,api_key = self.key)
         else:
             client = OpenAI(base_url = self.endpoint,api_key = self.key)
-        
         # 去除选项字母，防止大模型直接输出字母而非内容
-        options_list = q_info['options'].split('\n') if q_info.get('options') else []
+        options_list = q_info['options'].split('\n')
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
         options = "\n".join(cleaned_options)
-        
         # 判断题目类型
         if q_info['type'] == "single":
             completion = client.chat.completions.create(
@@ -529,7 +511,13 @@ class AI(Tiku):
             )
 
         try:
-            self.last_request_time = time.time()  # 记录请求时间
+            if self.last_request_time:
+                interval_time = time.time() - self.last_request_time
+                if interval_time < self.min_interval_seconds:
+                    sleep_time = self.min_interval_seconds - interval_time
+                    logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
+                    time.sleep(sleep_time)
+            self.last_request_time = time.time()
             response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
             sep = "\n"
             return sep.join(response['Answer']).strip()
@@ -541,8 +529,8 @@ class AI(Tiku):
         self.endpoint = self._conf['endpoint']
         self.key = self._conf['key']
         self.model = self._conf['model']
-        self.http_proxy = self._conf.get('http_proxy', '')
-        self.min_interval_seconds = int(self._conf.get('min_interval_seconds', 1))
+        self.http_proxy = self._conf['http_proxy']
+        self.min_interval_seconds = int(self._conf['min_interval_seconds'])
 
 class SiliconFlow(Tiku):
     """硅基流动大模型答题实现"""
@@ -630,16 +618,16 @@ class SiliconFlow(Tiku):
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
         self.min_interval = int(self._conf.get('min_interval_seconds', 3))
 
-# ------------------------ 阿里云百炼大模型题库类（替换原豆包类） ------------------------
-class Bailian(Tiku):
-    """阿里云百炼大模型答题实现（替换原豆包模型）"""
+# ------------------------ 豆包大模型题库类（适配火山方舟） ------------------------
+class Doubao(Tiku):
+    """豆包大模型答题实现（适配火山方舟的豆包1.5 Pro 32K接口）"""
     def __init__(self) -> None:
         super().__init__()
-        self.name = '阿里云百炼大模型'
+        self.name = '豆包1.5 Pro 32K（火山方舟）'
         self.last_request_time = None  # 记录最后一次请求时间，防止频率超限
 
     def _query(self, q_info: dict):
-        """核心：调用阿里云百炼API查询题目答案"""
+        """核心：调用火山方舟的豆包API查询题目答案"""
         # 工具函数：清理大模型输出的多余格式（比如```json包裹）
         def clean_response(content):
             pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
@@ -652,7 +640,7 @@ class Bailian(Tiku):
         q_options = q_info.get('options', '')  # 选项可能为空（如填空题）
         full_question = f"题目：{q_title}\n选项：{q_options}" if q_options else f"题目：{q_title}"
 
-        # 2. 构造百炼API的系统提示词（按题目类型定制）
+        # 2. 构造豆包API的系统提示词（按题目类型定制，更精简）
         system_prompt = ""
         if q_type == "single":
             system_prompt = "本题为单选题，仅选择一个正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回：{\"Answer\": [\"正确选项内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
@@ -665,65 +653,69 @@ class Bailian(Tiku):
         else:
             system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
 
-        # 3. 处理请求频率限制（避免API超限）
+        # 3. 构造火山方舟API请求参数
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"  # 火山方舟的API密钥
+        }
+        payload = {
+            "model": self.model,  # 火山方舟的豆包模型名
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": full_question}
+            ],
+            "temperature": 0.1,  # 低随机性，保证答案稳定
+            "max_tokens": 1024,
+            "stream": False  # 非流式输出
+        }
+
+        # 4. 处理请求频率限制（避免API超限）
         if self.last_request_time:
             interval = time.time() - self.last_request_time
             if interval < self.min_interval:
                 sleep_time = self.min_interval - interval
-                logger.debug(f"百炼API请求间隔过短，等待{sleep_time:.2f}秒")
+                logger.debug(f"豆包API请求间隔过短，等待{sleep_time:.2f}秒")
                 time.sleep(sleep_time)
         self.last_request_time = time.time()
 
-        # 4. 初始化OpenAI客户端（百炼兼容OpenAI接口）
+        # 5. 调用火山方舟的豆包API并解析结果
         try:
-            # 配置客户端
-            client_kwargs = {
-                "base_url": self.endpoint,
-                "api_key": self.api_key
-            }
-            # 若有代理，添加代理配置
-            if self.proxy:
-                client_kwargs["http_client"] = httpx.Client(proxy=self.proxy)
-            client = OpenAI(**client_kwargs)
-
-            # 调用百炼API
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": full_question}
-                ],
-                temperature=0.1,  # 低随机性，保证答案稳定
-                max_tokens=1024,
-                stream=False  # 非流式输出
+            response = requests.post(
+                url=self.api_endpoint,
+                headers=headers,
+                json=payload,
+                verify=False,
+                timeout=30
             )
+            response.raise_for_status()  # 抛出HTTP错误（如401、429）
+            res_json = response.json()
 
-            # 5. 解析返回的答案
-            content = completion.choices[0].message.content
+            # 解析返回的答案
+            content = res_json['choices'][0]['message']['content']
             cleaned_content = clean_response(content)
             answer_json = json.loads(cleaned_content)
             answer_list = answer_json.get('Answer', [])
 
             if not answer_list:
-                logger.error("百炼返回的答案为空")
+                logger.error("豆包返回的答案为空")
                 return None
 
             # 拼接答案（兼容原有逻辑的字符串格式）
             return "\n".join(answer_list).strip()
 
+        except requests.exceptions.RequestException as e:
+            logger.error(f"豆包API请求失败：{str(e)}，响应内容：{response.text if 'response' in locals() else '无'}")
+        except json.JSONDecodeError as e:
+            logger.error(f"豆包返回内容解析失败：{str(e)}，原始内容：{content}")
         except Exception as e:
-            logger.error(f"百炼API调用失败：{e}")
-            return None
+            logger.error(f"豆包答题逻辑异常：{str(e)}")
+
+        return None
 
     def _init_tiku(self):
-        """从config.ini加载阿里云百炼配置"""
-        # 固定使用你提供的API Key，也可从配置文件读取
-        self.api_key = self._conf.get('bailian_api_key', 'sk-2ab458d48d0248c9a96f0f575399e8e3')
-        # 百炼OpenAI兼容接口端点
-        self.endpoint = self._conf.get('bailian_endpoint', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
-        # 百炼模型名（默认使用qwen-plus，可根据需要更换为qwen-max/qwen-flash等）
-        self.model = self._conf.get('bailian_model', 'qwen-plus')
-        # 可选代理
-        self.proxy = self._conf.get('bailian_proxy', '')
-        # 请求间隔（秒）
-        self.min_interval = int(self._conf.get('bailian_min_interval', 1))
+        """从config.ini加载火山方舟的豆包配置"""
+        # 从[tiku]配置中读取参数
+        self.api_endpoint = self._conf.get('doubao_endpoint', 'https://ark.cn-beijing.volces.com/api/v3/chat/completions')
+        self.api_key = self._conf['doubao_api_key']  # 火山方舟的API密钥
+        self.model = self._conf.get('doubao_model', 'doubao-1-5-pro-32k-250115')  # 火山方舟的豆包模型名
+        self.min_interval = int(self._conf.get('doubao_min_interval', 1))  # 请求间隔（秒）
