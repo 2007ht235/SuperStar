@@ -8,8 +8,8 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 
-# 导入边缘网关题库类（需确保tiku.py和base.py在同一目录）
-from tiku import DoubaoTiku
+# 改为相对导入：tiku.py和base.py在同一api文件夹下
+from .tiku import DoubaoTiku
 
 from api.answer import *
 from api.cipher import AESCipher
@@ -77,11 +77,11 @@ class Chaoxing:
         def is_failure(result):
             return result != Chaoxing.StudyResult.SUCCESS
 
-    # 修复1：移除未定义的Tiku类型注解，改为兼容写法
+    # 修复Tiku类型注解为DoubaoTiku，移除未定义的类型引用
     def __init__(self, account: Account = None, tiku: DoubaoTiku = None,**kwargs):
         self.account = account
         self.cipher = AESCipher()
-        # 适配边缘网关题库类，若未传入则初始化默认实例
+        # 若未传入tiku实例，自动初始化DoubaoTiku
         self.tiku = tiku if tiku else DoubaoTiku(conf_path="config.ini")
         self.kwargs = kwargs
         self.rollback_times = 0
@@ -101,7 +101,11 @@ class Chaoxing:
             "doubleFactorLogin": 0,
             "independentId": 0,
         }
-        logger.trace("正在尝试登录...") if hasattr(logger, 'trace') else logger.debug("正在尝试登录...")
+        # 兼容logger.trace（无则用debug）
+        if hasattr(logger, 'trace'):
+            logger.trace("正在尝试登录...")
+        else:
+            logger.debug("正在尝试登录...")
         resp = _session.post(_url, headers=gc.HEADERS, data=_data)
         if resp and resp.json()["status"] == True:
             save_cookies(_session)
@@ -122,8 +126,11 @@ class Chaoxing:
         _session = init_session()
         _url = "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/courselistdata"
         _data = {"courseType": 1, "courseFolderId": 0, "query": "", "superstarClass": 0}
-        logger.trace("正在读取所有的课程列表...") if hasattr(logger, 'trace') else logger.debug("正在读取所有的课程列表...")
-        # 接口突然抽风, 增加headers
+        if hasattr(logger, 'trace'):
+            logger.trace("正在读取所有的课程列表...")
+        else:
+            logger.debug("正在读取所有的课程列表...")
+        # 补充请求头解决接口抽风问题
         _headers = {
             "Host": "mooc2-ans.chaoxing.com",
             "sec-ch-ua-platform": '"Windows"',
@@ -141,7 +148,6 @@ class Chaoxing:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
         }
         _resp = _session.post(_url, headers=_headers, data=_data)
-        # logger.trace(f"原始课程列表内容:\n{_resp.text}")
         logger.info("课程列表读取完毕...")
         course_list = decode_course_list(_resp.text)
 
@@ -162,9 +168,11 @@ class Chaoxing:
     def get_course_point(self, _courseid, _clazzid, _cpi):
         _session = init_session()
         _url = f"https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse?courseid={_courseid}&clazzid={_clazzid}&cpi={_cpi}&ut=s"
-        logger.trace("开始读取课程所有章节...") if hasattr(logger, 'trace') else logger.debug("开始读取课程所有章节...")
+        if hasattr(logger, 'trace'):
+            logger.trace("开始读取课程所有章节...")
+        else:
+            logger.debug("开始读取课程所有章节...")
         _resp = _session.get(_url)
-        # logger.trace(f"原始章节列表内容:\n{_resp.text}")
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
@@ -172,28 +180,19 @@ class Chaoxing:
         _session = init_session()
         job_list = []
         job_info = {}
-        for _possible_num in [
-            "0",
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-        ]:  # 学习界面任务卡片数, 很少有3个的, 但是对于章节解锁任务点少一个都不行, 可以从API /mooc-ans/mycourse/studentstudyAjax获取值, 或者干脆直接加, 但二者都会造成额外的请求
+        for _possible_num in ["0", "1", "2", "3", "4", "5", "6"]:
             _url = f"https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid={_clazzid}&courseid={_courseid}&knowledgeid={_knowledgeid}&num={_possible_num}&ut=s&cpi={_cpi}&v=20160407-3&mooc2=1"
-            logger.trace("开始读取章节所有任务点...") if hasattr(logger, 'trace') else logger.debug("开始读取章节所有任务点...")
+            if hasattr(logger, 'trace'):
+                logger.trace("开始读取章节所有任务点...")
+            else:
+                logger.debug("开始读取章节所有任务点...")
             _resp = _session.get(_url)
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
-                # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
                 return [], _job_info
             job_list += _job_list
             job_info.update(_job_info)
-            # if _job_list and len(_job_list) != 0:
-            #     break
-        # logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
         return job_list, job_info
 
@@ -241,15 +240,14 @@ class Chaoxing:
             resp = _session.get(_url)
             if resp.status_code == 200:
                 _success = True
-                break  # 如果返回为200正常, 则跳出循环
+                break
             elif resp.status_code == 403:
-                continue  # 如果出现403无权限报错, 则继续尝试不同的rt参数
+                continue
         if _success:
             return resp.json(), 200
         else:
-            # 若出现两个rt参数都返回403的情况, 则跳过当前任务
             logger.warning("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
-            return {"isPassed": False}, 403  # 返回一个字典和当前状态
+            return {"isPassed": False}, 403
 
     def study_video(
         self, _course, _job, _job_info, _speed: float = 1.0, _type: str = "Video"
@@ -294,7 +292,6 @@ class Chaoxing:
                     _isPassed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, _duration, _duration, _type)
                     if _isPassed['isPassed']:
                         _isFinished = True
-                # 播放进度条
                 show_progress(_job["name"], _playingTime, _wait_time, _duration, _speed)
                 _playingTime += _wait_time
             print("\r", end="", flush=True)
@@ -304,29 +301,6 @@ class Chaoxing:
             return self.StudyResult.ERROR
 
     def study_document(self, _course, _job) -> StudyResult:
-        """
-        Study a document in Chaoxing platform.
-
-        This method makes a GET request to fetch document information for a given course and job.
-
-        Args:
-            _course (dict): Dictionary containing course information with keys:
-                - courseId: ID of the course
-                - clazzId: ID of the class
-            _job (dict): Dictionary containing job information with keys:
-                - jobid: ID of the job
-                - otherinfo: String containing node information
-                - jtoken: Authentication token for the job
-
-        Returns:
-            requests.Response: Response object from the GET request
-
-        Note:
-            This method requires the following helper functions:
-            - init_session(): To initialize a new session
-            - get_timestamp(): To get current timestamp
-            - re module for regular expression matching
-        """
         _session = init_session()
         _url = f"https://mooc1.chaoxing.com/ananas/job/document?jobid={_job['jobid']}&knowledgeid={re.findall(r'nodeId_(.*?)-', _job['otherinfo'])[0]}&courseid={_course['courseId']}&clazzid={_course['clazzId']}&jtoken={_job['jtoken']}&_dc={get_timestamp()}"
         _resp = _session.get(_url)
@@ -336,10 +310,10 @@ class Chaoxing:
             return self.StudyResult.SUCCESS
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
-        # 修复2：适配DoubaoTiku的DISABLE属性（若未定义则默认False）
-        if hasattr(self.tiku, 'DISABLE') and self.tiku.DISABLE or not self.tiku:
+        # 适配DoubaoTiku的DISABLE属性
+        if self.tiku.DISABLE or not self.tiku:
             return self.StudyResult.SUCCESS
-        _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
+        _ORIGIN_HTML_CONTENT = ""
 
         def random_answer(options: str) -> str:
             answer = ""
@@ -352,15 +326,12 @@ class Chaoxing:
                 logger.debug(f"当前选项列表[cut后] -> {_op_list}")
 
                 if not _op_list:
-                    logger.error(
-                        "选项为空, 未能正确提取题目选项信息! 请反馈并提供以上信息"
-                    )
+                    logger.error("选项为空, 未能正确提取题目选项信息! 请反馈并提供以上信息")
                     return answer
 
                 available_options = len(_op_list)
                 select_count = 0
         
-                # 根据可用选项数量调整可能选择的选项数
                 if available_options <= 1:
                     select_count = available_options
                 else:
@@ -376,7 +347,6 @@ class Chaoxing:
             
                     weights = weights_map.get(max_possible, [0.3, 0.4, 0.3])
                     possible_counts = list(range(min_possible, max_possible + 1))
-            
                     weights = weights[:len(possible_counts)]
             
                     weights_sum = sum(weights)
@@ -386,18 +356,12 @@ class Chaoxing:
                     select_count = random.choices(possible_counts, weights=weights, k=1)[0]
 
                 selected_options = random.sample(_op_list, select_count) if select_count > 0 else []
-
                 for option in selected_options:
-                    answer += option[:1]  # 取首字为答案，例如A或B
-
+                    answer += option[:1]
                 answer = "".join(sorted(answer))
             elif q["type"] == "single":
-                answer = random.choice(options.split("\n"))[
-                    :1
-                ]  # 取首字为答案, 例如A或B
-            # 判断题处理
+                answer = random.choice(options.split("\n"))[:1]
             elif q["type"] == "judgement":
-                # 修复3：适配DoubaoTiku的judgement_select方法（若无则随机）
                 if hasattr(self.tiku, 'judgement_select'):
                     answer = "true" if self.tiku.judgement_select(res) else "false"
                 else:
@@ -406,22 +370,6 @@ class Chaoxing:
             return answer
 
         def multi_cut(answer: str):
-            """
-            将多选题答案字符串按特定字符进行切割, 并返回切割后的答案列表
-
-            参数:
-            answer(str): 多选题答案字符串.
-
-            返回:
-            list[str]: 切割后的答案列表, 如果无法切割, 则返回默认的选项列表None
-
-            注意:
-            如果无法从网页中提取题目信息, 将记录警告日志并返回None
-            """
-            # cut_char = [',','，','|','\n','\r','\t','#','*','-','_','+','@','~','/','\\','.','&',' ']    # 多选答案切割符
-            # ',' 在常规被正确划分的, 选项中出现, 导致 multi_cut 无法正确划分选项 #391
-            # IndexError: Cannot choose from an empty sequence #391
-            # 同时为了避免没有考虑到的 case, 应该先按照 '\n' 匹配, 匹配不到再按照其他字符匹配
             cut_char = [
                 "\n",
                 ",",
@@ -442,12 +390,12 @@ class Chaoxing:
                 "&",
                 " ",
                 "、",
-            ]  # 多选答案切割符
+            ]
             res = cut(answer)
             if res is None:
                 logger.warning(
                     f"未能从网页中提取题目信息, 以下为相关信息：\n\t{answer}\n\n{_ORIGIN_HTML_CONTENT}\n"
-                )  # 尝试输出网页内容和选项信息
+                )
                 logger.warning("未能正确提取题目选项信息! 请反馈并提供以上信息")
                 return None
             else:
@@ -459,7 +407,6 @@ class Chaoxing:
                 res = [res]
             for c in res:
                 cleaned_res.append(re.sub(r'^[A-Za-z]|[.,!?;:，。！？；：]', '', c))
-
             return cleaned_res
 
         def is_subsequence(a, o):
@@ -473,18 +420,12 @@ class Chaoxing:
                     while retries < max_retries:
                         try:
                             _resp = func(*args, **kwargs)
-                            
-                            # 未创建完成该测验则不进行答题，目前遇到的情况是未创建完成等同于没题目
                             if '教师未创建完成该测验' in _resp.text:
                                 raise PermissionError("教师未创建完成该测验")
-
                             questions = decode_questions_info(_resp.text)
-                    
                             if _resp.status_code == 200 and questions.get("questions"):
                                 return (_resp, questions)
-                    
                             logger.warning(f"无效响应 (Code: {getattr(_resp, 'status_code', 'Unknown')}), 重试中... ({retries+1}/{max_retries})")
-                
                         except requests.exceptions.RequestException as e:
                             logger.warning(f"请求失败: {str(e)[:50]}, 重试中... ({retries+1}/{max_retries})")
                         retries += 1
@@ -493,7 +434,6 @@ class Chaoxing:
                 return wrapper
             return decorator
 
-        # 学习通这里根据参数差异能重定向至两个不同接口, 需要定向至https://mooc1.chaoxing.com/mooc-ans/workHandle/handle
         _session = init_session()
         headers = {
             "Host": "mooc1.chaoxing.com",
@@ -547,45 +487,32 @@ class Chaoxing:
             logger.error(f"请求失败: {e}")
             return self.StudyResult.ERROR
         
-        _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
+        _ORIGIN_HTML_CONTENT = final_resp.text
 
-        # 搜题
+        # 搜题核心逻辑
         total_questions = len(questions["questions"])
         found_answers = 0
         for q in questions["questions"]:
             logger.debug(f"当前题目信息 -> {q}")
-            # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay",0)
             time.sleep(query_delay)
-            # 修复4：适配DoubaoTiku的query方法（原方法是answer_question，此处封装适配）
-            if hasattr(self.tiku, 'query'):
-                res = self.tiku.query(q)
-            else:
-                # 调用DoubaoTiku的answer_question方法，传入题目文本
-                res = self.tiku.answer_question(q["title"])
+            # 调用DoubaoTiku的query方法搜题
+            res = self.tiku.query(q)
             answer = ""
             if not res:
-                # 随机答题
                 answer = random_answer(q["options"])
                 q[f'answerSource{q["id"]}'] = "random"
             else:
-                # 根据响应结果选择答案
                 if q["type"] == "multiple":
-                    # 多选处理
                     options_list = multi_cut(q["options"])
                     res_list = multi_cut(res)
                     if res_list is not None and options_list is not None:
                         for _a in clean_res(res_list):
                             for o in options_list:
-                                if (
-                                        is_subsequence(_a, o)  # 去掉各种符号和前面ABCD的答案应当是选项的子序列
-                                ):
+                                if is_subsequence(_a, o):
                                     answer += o[:1]
-                        # 对答案进行排序, 否则会提交失败
                         answer = "".join(sorted(answer))
-                    # else 如果分割失败那么就直接到下面去随机选
                 elif q["type"] == "single":
-                    # 单选也进行切割，主要是防止返回的答案有异常字符
                     options_list = multi_cut(q["options"])
                     if options_list is not None:
                         t_res = clean_res(res)
@@ -597,48 +524,46 @@ class Chaoxing:
                     if hasattr(self.tiku, 'judgement_select'):
                         answer = "true" if self.tiku.judgement_select(res) else "false"
                     else:
-                        # 适配边缘网关返回的判断题答案
                         answer = "true" if "正确" in res or "对" in res else "false"
                 elif q["type"] == "completion":
                     if isinstance(res,list):
-                        answer = "".join(answer)
+                        answer = "".join(res)
                     elif isinstance(res,str):
                         answer = res
                 else:
-                    # 其他类型直接使用答案 （目前仅知有简答题，待补充处理）
                     answer = res
 
-                if not answer:  # 检查 answer 是否为空
+                if not answer:
                     logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                    answer = random_answer(q["options"])  # 如果为空，则随机选择答案
+                    answer = random_answer(q["options"])
                     q[f'answerSource{q["id"]}'] = "random"
                 else:
                     logger.info(f"成功获取到答案：{answer}")
                     q[f'answerSource{q["id"]}'] = "cover"
                     found_answers += 1
-            # 填充答案
             q["answerField"][f'answer{q["id"]}'] = answer
             logger.info(f'{q["title"]} 填写答案为 {answer}')
-        # 修复5：适配DoubaoTiku的COVER_RATE属性（从config.ini读取）
+        
+        # 覆盖率判断
         cover_rate = (found_answers / total_questions) * 100
-        cover_rate_threshold = getattr(self.tiku, 'cover_rate', 0.8) * 100
+        cover_rate_threshold = self.tiku.COVER_RATE * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
-        # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
-        # 修复6：适配DoubaoTiku的get_submit_params方法
-        if hasattr(self.tiku, 'get_submit_params') and self.tiku.get_submit_params() == "1":
+
+        # 提交逻辑
+        if self.tiku.get_submit_params() == "1":
             questions["pyFlag"] = "1"
         elif cover_rate >= cover_rate_threshold or self.rollback_times >= 1:
             questions["pyFlag"] = ""
         else:
             questions["pyFlag"] = "1"
             logger.info(f"章节检测题库覆盖率低于{cover_rate_threshold:.0f}%，不予提交")
+
         # 组建提交表单
         if questions["pyFlag"] == "1":
             for q in questions["questions"]:
                 questions.update(
                     {
-                        f'answer{q["id"]}':
-                            q["answerField"][f'answer{q["id"]}'] if q[f'answerSource{q["id"]}'] == "cover" else '',
+                        f'answer{q["id"]}': q["answerField"][f'answer{q["id"]}'] if q[f'answerSource{q["id"]}'] == "cover" else '',
                         f'answertype{q["id"]}': q["answerField"][f'answertype{q["id"]}'],
                     }
                 )
@@ -669,7 +594,6 @@ class Chaoxing:
                 "Sec-Fetch-Site": "same-origin",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Dest": "empty",
-                # "Referer": "https://mooc1.chaoxing.com/mooc-ans/work/doHomeWorkNew?courseId=246831735&workAnswerId=52680423&workId=37778125&api=1&knowledgeid=913820156&classId=107515845&oldWorkId=07647c38d8de4c648a9277c5bed7075a&jobid=work-07647c38d8de4c648a9277c5bed7075a&type=&isphone=false&submit=false&enc=1d826aab06d44a1198fc983ed3d243b1&cpi=338350298&mooc2=1&skipHeader=true&originJobId=work-07647c38d8de4c648a9277c5bed7075a",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
             },
         )
@@ -686,9 +610,6 @@ class Chaoxing:
         return self.StudyResult.SUCCESS
 
     def strdy_read(self, _course, _job, _job_info) -> StudyResult:
-        """
-        阅读任务学习, 仅完成任务点, 并不增长时长
-        """
         _session = init_session()
         _resp = _session.get(
             url="https://mooc1.chaoxing.com/ananas/job/readv2",
@@ -710,7 +631,6 @@ class Chaoxing:
 
     def study_emptypage(self, _course, _chapterId):
         _session = init_session()
-        # &cpi=0&verificationcode=&mooc2=1&microTopicId=0&editorPreview=0
         _resp = _session.get(
             url="https://mooc1.chaoxing.com/mooc-ans/mycourse/studentstudyAjax",
             params={
@@ -731,9 +651,8 @@ class Chaoxing:
             logger.info(f"空页面任务完成 -> {_chapterId['title']}")
             return self.StudyResult.SUCCESS
 
-# 补充缺失的cut函数（原代码中未定义，适配multi_cut逻辑）
+# 补充缺失的cut函数，解决选项分割问题
 def cut(s):
-    """分割选项字符串，适配multi_cut"""
     cut_char = [
         "\n",
         ",",
@@ -760,8 +679,7 @@ def cut(s):
             parts = [p.strip() for p in s.split(char) if p.strip()]
             if parts:
                 return parts
-    # 若没有分割符，按单个选项返回（如"A选项B选项"拆分为["A选项","B选项"]）
-    import re
+    # 按字母拆分选项（如"A选项B选项"拆分为["A选项","B选项"]）
     pattern = re.compile(r'([A-Za-z][^A-Za-z]*)')
     parts = [p.strip() for p in pattern.findall(s) if p.strip()]
     return parts if parts else None
