@@ -8,10 +8,11 @@ import os
 import traceback
 from urllib3 import disable_warnings, exceptions
 
+# 修复导入路径：原DoubaoTiku替换为Tiku基类+Doubao实现
 from api.logger import logger
 from api.base import Chaoxing, Account
 from api.exceptions import LoginError, InputFormatError, MaxRollBackExceeded
-from api.tiku import DoubaoTiku
+from api.tiku import Tiku  # 导入Tiku基类（替代原DoubaoTiku）
 from api.notification import Notification
 
 # 关闭警告
@@ -79,7 +80,7 @@ def load_config_from_file(config_path):
         if "notopen_action" not in common_config:
             common_config["notopen_action"] = "retry"
     
-    # 检查并读取tiku节（适配DoubaoTiku的配置）
+    # 检查并读取tiku节（适配DeepSeek的Doubao类配置）
     if config.has_section("tiku"):
         tiku_config = dict(config.items("tiku"))
         # 处理数值类型转换
@@ -140,7 +141,7 @@ class RollBackManager:
 
 
 def init_chaoxing(common_config, tiku_config):
-    """初始化超星实例（适配DoubaoTiku）"""
+    """初始化超星实例（适配DeepSeek的Doubao类）"""
     username = common_config.get("username", "")
     password = common_config.get("password", "")
     
@@ -151,12 +152,16 @@ def init_chaoxing(common_config, tiku_config):
     
     account = Account(username, password)
     
-    # 初始化DoubaoTiku（替换原Tiku类）
+    # 初始化DeepSeek题库（替代原DoubaoTiku）
     try:
-        tiku = DoubaoTiku(conf_path="config.ini")  # 读取config.ini配置
-        logger.info("DoubaoTiku题库初始化成功")
+        tiku = Tiku()  # 初始化Tiku基类
+        tiku.config_set(tiku_config)  # 加载tiku配置
+        tiku = tiku.get_tiku_from_config()  # 加载Doubao类（内部已替换为DeepSeek）
+        tiku.init_tiku()  # 初始化DeepSeek配置（API Key/地址等）
+        logger.info("DeepSeek题库初始化成功")
     except Exception as e:
         logger.error(f"题库初始化失败: {str(e)}，将禁用题库功能")
+        logger.error(traceback.format_exc())
         tiku = None  # 初始化失败则禁用题库
     
     # 获取查询延迟设置
@@ -169,11 +174,11 @@ def init_chaoxing(common_config, tiku_config):
 
 
 def handle_not_open_chapter(notopen_action, point, tiku, RB, auto_skip_notopen=False):
-    """处理未开放章节（适配DoubaoTiku）"""
+    """处理未开放章节（适配DeepSeek的Doubao类）"""
     if notopen_action == "retry":
         # 默认处理方式：重试
-        # 针对题库启用情况（适配DoubaoTiku的属性）
-        if not tiku or getattr(tiku, 'DISABLE', True) or not getattr(tiku, 'submit', False):
+        # 适配DeepSeek题库的属性（保持原逻辑，仅调整属性名兼容）
+        if not tiku or getattr(tiku, 'DISABLE', True) or not getattr(tiku, 'SUBMIT', False):
             # 未启用题库或未开启题库提交, 章节检测未完成会导致无法开始下一章, 直接退出
             logger.error(
                 "章节未开启, 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
