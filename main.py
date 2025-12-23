@@ -11,7 +11,7 @@ from urllib3 import disable_warnings, exceptions
 from api.logger import logger
 from api.base import Chaoxing, Account
 from api.exceptions import LoginError, InputFormatError, MaxRollBackExceeded
-from api.answer import Tiku
+from api.tiku import DoubaoTiku
 from api.notification import Notification
 
 # 关闭警告
