@@ -79,14 +79,17 @@ def load_config_from_file(config_path):
         if "notopen_action" not in common_config:
             common_config["notopen_action"] = "retry"
     
-    # 检查并读取tiku节
+    # 检查并读取tiku节（适配DoubaoTiku的配置）
     if config.has_section("tiku"):
         tiku_config = dict(config.items("tiku"))
         # 处理数值类型转换
-        for key in ["delay", "cover_rate"]:
+        for key in ["delay", "cover_rate", "doubao_min_interval"]:
             if key in tiku_config:
-                tiku_config[key] = float(tiku_config[key])
-
+                try:
+                    tiku_config[key] = float(tiku_config[key])
+                except ValueError:
+                    logger.warning(f"配置项 {key} 格式错误，使用默认值")
+    
     # 检查并读取notification节
     if config.has_section("notification"):
         notification_config = dict(config.items("notification"))
@@ -137,7 +140,7 @@ class RollBackManager:
 
 
 def init_chaoxing(common_config, tiku_config):
-    """初始化超星实例"""
+    """初始化超星实例（适配DoubaoTiku）"""
     username = common_config.get("username", "")
     password = common_config.get("password", "")
     
@@ -148,11 +151,13 @@ def init_chaoxing(common_config, tiku_config):
     
     account = Account(username, password)
     
-    # 设置题库
-    tiku = Tiku()
-    tiku.config_set(tiku_config)  # 载入配置
-    tiku = tiku.get_tiku_from_config()  # 载入题库
-    tiku.init_tiku()  # 初始化题库
+    # 初始化DoubaoTiku（替换原Tiku类）
+    try:
+        tiku = DoubaoTiku(conf_path="config.ini")  # 读取config.ini配置
+        logger.info("DoubaoTiku题库初始化成功")
+    except Exception as e:
+        logger.error(f"题库初始化失败: {str(e)}，将禁用题库功能")
+        tiku = None  # 初始化失败则禁用题库
     
     # 获取查询延迟设置
     query_delay = tiku_config.get("delay", 0)
@@ -164,11 +169,11 @@ def init_chaoxing(common_config, tiku_config):
 
 
 def handle_not_open_chapter(notopen_action, point, tiku, RB, auto_skip_notopen=False):
-    """处理未开放章节"""
+    """处理未开放章节（适配DoubaoTiku）"""
     if notopen_action == "retry":
         # 默认处理方式：重试
-        # 针对题库启用情况
-        if not tiku or tiku.DISABLE or not tiku.SUBMIT:
+        # 针对题库启用情况（适配DoubaoTiku的属性）
+        if not tiku or getattr(tiku, 'DISABLE', True) or not getattr(tiku, 'submit', False):
             # 未启用题库或未开启题库提交, 章节检测未完成会导致无法开始下一章, 直接退出
             logger.error(
                 "章节未开启, 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
@@ -203,7 +208,11 @@ def process_job(chaoxing, course, job, job_info, speed):
     """处理单个任务点"""
     # 视频任务
     if job["type"] == "video":
-        logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        # 兼容logger.trace（无则用debug）
+        if hasattr(logger, 'trace'):
+            logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        else:
+            logger.debug(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
         # 超星的接口没有返回当前任务是否为Audio音频任务
         video_result = chaoxing.study_video(
             course, job, job_info, _speed=speed, _type="Video"
@@ -218,15 +227,24 @@ def process_job(chaoxing, course, job, job_info, speed):
             )
     # 文档任务
     elif job["type"] == "document":
-        logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        if hasattr(logger, 'trace'):
+            logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        else:
+            logger.debug(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
         chaoxing.study_document(course, job)
     # 测验任务
     elif job["type"] == "workid":
-        logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
+        if hasattr(logger, 'trace'):
+            logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
+        else:
+            logger.debug(f"识别到章节检测任务, 任务章节: {course['title']}")
         chaoxing.study_work(course, job, job_info)
     # 阅读任务
     elif job["type"] == "read":
-        logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+        if hasattr(logger, 'trace'):
+            logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+        else:
+            logger.debug(f"识别到阅读任务, 任务章节: {course['title']}")
         chaoxing.strdy_read(course, job, job_info)
 
 
@@ -276,7 +294,10 @@ def process_chapter(chaoxing, course, point, RB, notopen_action, speed, auto_ski
     # 可能存在章节无任何内容的情况
     if not jobs:
         if RB.rollback_times > 0:
-            logger.trace(f"回滚中 尝试空页面任务, 任务章节: {course['title']}")
+            if hasattr(logger, 'trace'):
+                logger.trace(f"回滚中 尝试空页面任务, 任务章节: {course['title']}")
+            else:
+                logger.debug(f"回滚中 尝试空页面任务, 任务章节: {course['title']}")
             chaoxing.study_emptypage(course, point)
         return 1, auto_skip_notopen  # 继续下一章节
     
