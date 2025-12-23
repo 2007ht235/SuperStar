@@ -1,145 +1,755 @@
-import openai
-import time
+import configparser
 import json
-import logging
-from configparser import ConfigParser
+import random
+import re
+import time
+from pathlib import Path
+from re import sub
 
-# 初始化日志配置
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import httpx
+import requests
+from openai import OpenAI
+from urllib3 import disable_warnings, exceptions
 
-class DoubaoTiku:
-    def __init__(self, conf_path="config.ini"):
-        """初始化：加载配置并设置OpenAI客户端"""
-        self._conf = self._load_config(conf_path)
-        self.last_request_time = None
-        self._init_client()
-        # 加载业务逻辑配置（保留原有网课答题的参数）
-        self._load_business_config()
+# 关闭警告
+disable_warnings(exceptions.InsecureRequestWarning)
 
-    def _load_config(self, conf_path):
-        """加载config.ini配置文件"""
-        conf = ConfigParser()
-        if not conf.read(conf_path, encoding='utf-8'):
-            raise FileNotFoundError(f"配置文件 {conf_path} 不存在或读取失败")
-        return conf
 
-    def _init_client(self):
-        """初始化OpenAI兼容客户端（适配你的config.ini字段名）"""
-        # 从配置文件读取边缘网关核心参数（匹配你的config.ini字段）
-        self.api_key = self._conf.get('tiku', 'doubao_api_key')
-        self.base_url = self._conf.get('tiku', 'doubao_endpoint', fallback='https://ai-gateway.vei.volces.com/v1')
-        self.model = self._conf.get('tiku', 'doubao_model', fallback='doubao-seed-1.6')
-        self.min_interval = int(self._conf.get('tiku', 'doubao_min_interval', fallback=1))
-        self.max_tokens = 1024  # 固定Token数，也可在config.ini新增配置项读取
+class CacheDAO:
+    """
+    @Author: SocialSisterYi
+    @Reference: https://github.com/SocialSisterYi/xuexiaoyi-to-xuexitong-tampermonkey-proxy
+    """
+    DEFAULT_CACHE_FILE = "cache.json"
 
-        # 校验必填API Key
-        if not self.api_key:
-            raise ValueError("请在config.ini的[tiku]节点配置doubao_api_key（边缘网关API Key）")
+    def __init__(self, file: str = DEFAULT_CACHE_FILE):
+        self.cache_file = Path(file)
+        if not self.cache_file.is_file():
+            self._write_cache({})
 
-        # 初始化OpenAI客户端
-        self.client = openai.OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
+    def _read_cache(self) -> dict:
+        try:
+            with self.cache_file.open("r", encoding="utf8") as fp:
+                return json.load(fp)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _write_cache(self, data: dict) -> None:
+        try:
+            with self.cache_file.open("w", encoding="utf8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=4)
+        except IOError as e:
+            logger.error(f"Failed to write cache: {e}")
+
+    def get_cache(self, question: str):
+        data = self._read_cache()
+        return data.get(question)
+
+    def add_cache(self, question: str, answer: str) -> None:
+        data = self._read_cache()
+        data[question] = answer
+        self._write_cache(data)
+
+
+class Tiku:
+    CONFIG_PATH = "config.ini"  # 默认配置文件路径
+    DISABLE = False  # 停用标志
+    SUBMIT = False  # 提交标志
+    COVER_RATE = 0.8  # 覆盖率
+    true_list = []
+    false_list = []
+
+    def __init__(self) -> None:
+        self._name = None
+        self._api = None
+        self._conf = None
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+
+    @property
+    def api(self):
+        return self._api
+
+    @api.setter
+    def api(self, value):
+        self._api = value
+
+    @property
+    def token(self):
+        return self._token
+
+    @token.setter
+    def token(self, value):
+        self._token = value
+
+    def init_tiku(self):
+        # 仅用于题库初始化, 应该在题库载入后作初始化调用, 随后才可以使用题库
+        # 尝试根据配置文件设置提交模式
+        if not self._conf:
+            self.config_set(self._get_conf())
+        if not self.DISABLE:
+            # 设置提交模式
+            self.SUBMIT = True if self._conf['submit'] == 'true' else False
+            self.COVER_RATE = float(self._conf['cover_rate'])
+            self.true_list = self._conf['true_list'].split(',')
+            self.false_list = self._conf['false_list'].split(',')
+            # 调用自定义题库初始化
+            self._init_tiku()
+
+    def _init_tiku(self):
+        # 仅用于题库初始化, 例如配置token, 交由自定义题库完成
+        pass
+
+    def config_set(self, config):
+        self._conf = config
+
+    def _get_conf(self):
+        """
+        从默认配置文件查询配置, 如果未能查到, 停用题库
+        """
+        try:
+            config = configparser.ConfigParser()
+            config.read(self.CONFIG_PATH, encoding="utf8")
+            return config['tiku']
+        except (KeyError, FileNotFoundError):
+            logger.info("未找到tiku配置, 已忽略题库功能")
+            self.DISABLE = True
+            return None
+
+    def query(self, q_info: dict):
+        if self.DISABLE:
+            return None
+
+        # 预处理, 去除【单选题】这样与标题无关的字段
+        logger.debug(f"原始标题：{q_info['title']}")
+        q_info['title'] = sub(r'^\d+', '', q_info['title'])
+        q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
+        logger.debug(f"处理后标题：{q_info['title']}")
+
+        # 先过缓存
+        cache_dao = CacheDAO()
+        answer = cache_dao.get_cache(q_info['title'])
+        if answer:
+            logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
+            return answer.strip()
+        else:
+            answer = self._query(q_info)
+            if answer:
+                answer = answer.strip()
+                cache_dao.add_cache(q_info['title'], answer)
+                logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
+                if check_answer(answer, q_info['type'], self):
+                    return answer
+                else:
+                    logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
+                    return None
+
+            logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
+        return None
+
+    def _query(self, q_info: dict):
+        """
+        查询接口, 交由自定义题库实现
+        """
+        pass
+
+    def get_tiku_from_config(self):
+        """
+        从配置文件加载题库, 这个配置可以是用户提供, 可以是默认配置文件
+        """
+        if not self._conf:
+            # 尝试从默认配置文件加载
+            self.config_set(self._get_conf())
+        if self.DISABLE:
+            return self
+        try:
+            cls_name = self._conf['provider']
+            if not cls_name:
+                raise KeyError
+        except KeyError:
+            self.DISABLE = True
+            logger.error("未找到题库配置, 已忽略题库功能")
+            return self
+        new_cls = globals()[cls_name]()
+        new_cls.config_set(self._conf)
+        return new_cls
+
+    def judgement_select(self, answer: str) -> bool:
+        """
+        这是一个专用的方法, 要求配置维护两个选项列表, 一份用于正确选项, 一份用于错误选项, 以应对题库对判断题答案响应的各种可能的情况
+        它的作用是将获取到的答案answer与可能的选项列对比并返回对应的布尔值
+        """
+        if self.DISABLE:
+            return False
+        # 对响应的答案作处理
+        answer = answer.strip()
+        if answer in self.true_list:
+            return True
+        elif answer in self.false_list:
+            return False
+        else:
+            # 无法判断, 随机选择
+            logger.error(
+                f'无法判断答案 -> {answer} 对应的是正确还是错误, 请自行判断并加入配置文件重启脚本, 本次将会随机选择选项')
+            return random.choice([True, False])
+
+    def get_submit_params(self):
+        """
+        这是一个专用方法, 用于根据当前设置的提交模式, 响应对应的答题提交API中的pyFlag值
+        """
+        # 留空直接提交, 1保存但不提交
+        if self.SUBMIT:
+            return ""
+        else:
+            return "1"
+
+
+# 按照以下模板实现更多题库
+
+class TikuYanxi(Tiku):
+    # 言溪题库实现
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = '言溪题库'
+        self.api = 'https://tk.enncy.cn/query'
+        self._token = None
+        self._token_index = 0  # token队列计数器
+        self._times = 100  # 查询次数剩余, 初始化为100, 查询后校对修正
+
+    def _query(self, q_info: dict):
+        res = requests.get(
+            self.api,
+            params={
+                'question': q_info['title'],
+                'token': self._token,
+                # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
+                # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
+            },
+            verify=False
+        )
+        if res.status_code == 200:
+            res_json = res.json()
+            if not res_json['code']:
+                # 如果是因为TOKEN次数到期, 则更换token
+                if self._times == 0 or '次数不足' in res_json['data']['answer']:
+                    logger.info(f'TOKEN查询次数不足, 将会更换并重新搜题')
+                    self._token_index += 1
+                    self.load_token()
+                    # 重新查询
+                    return self._query(q_info)
+                logger.error(
+                    f'{self.name}查询失败:\n\t剩余查询数{res_json["data"].get("times", f"{self._times}(仅参考)")}:\n\t消息:{res_json["message"]}')
+                return None
+            self._times = res_json["data"].get("times", self._times)
+            return res_json['data']['answer'].strip()
+        else:
+            logger.error(f'{self.name}查询失败:\n{res.text}')
+        return None
+
+    def load_token(self):
+        token_list = self._conf['tokens'].split(',')
+        if self._token_index == len(token_list):
+            # TOKEN 用完
+            logger.error('TOKEN用完, 请自行更换再重启脚本')
+            raise PermissionError(f'{self.name} TOKEN 已用完, 请更换')
+        self._token = token_list[self._token_index]
+
+    def _init_tiku(self):
+        self.load_token()
+
+
+class TikuLike(Tiku):
+    # Like知识库实现
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'Like知识库'
+        self.ver = '1.0.8'  # 对应官网API版本
+        self.query_api = 'https://api.datam.site/search'
+        self.balance_api = 'https://api.datam.site/balance'
+        self.homepage = 'https://www.datam.site'
+        self._model = None
+        self._token = None
+        self._times = -1
+        self._search = False
+        self._count = 0
+
+    def _query(self, q_info: dict):
+        q_info_map = {"single": "【单选题】", "multiple": "【多选题】", "completion": "【填空题】", "judgement": "【判断题】"}
+        api_params_map = {0: "others", 1: "choose", 2: "fills", 3: "judge"}
+        q_info_prefix = q_info_map.get(q_info['type'], "【其他类型题目】")
+        option_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7, 'a': 0, "b": 1, "c": 2, "d": 3,
+                      "e": 4, "f": 5, "g": 6, "h": 7}
+        options = ', '.join(q_info['options']) if isinstance(q_info['options'], list) else q_info['options']
+        question = f"{q_info_prefix}{q_info['title']}\n{options}"
+        ret = ""
+        ans = ""
+        res = requests.post(
+            self.query_api,
+            json={
+                'query': question,
+                'token': self._token,
+                'model': self._model if self._model else '',
+                'search': self._search
+            },
+            verify=False
         )
 
-    def _load_business_config(self):
-        """加载网课答题的业务逻辑配置（保留原有参数）"""
-        self.submit = self._conf.getboolean('tiku', 'submit', fallback=True)
-        self.cover_rate = float(self._conf.get('tiku', 'cover_rate', fallback=0.8))
-        # 读取判断题选项映射
-        self.true_list = [item.strip() for item in self._conf.get('tiku', 'true_list', fallback='正确,对,√,是').split(',')]
-        self.false_list = [item.strip() for item in self._conf.get('tiku', 'false_list', fallback='错误,×,否,不对,不正确').split(',')]
-        logger.debug("业务配置加载完成：submit=%s, cover_rate=%.1f", self.submit, self.cover_rate)
+        if res.status_code == 200:
+            res_json = res.json()
+            q_type = res_json['data'].get('type', 0)
+            params = api_params_map.get(q_type, "")
+            tans = res_json['data'].get(params, "")
+            ans = ""
+            match q_type:
+                case 1:
+                    for i in tans:
+                        ans = ans + q_info['options'][option_map[i]] + '\n'
+                case 2:
+                    for i in tans:
+                        ans = ans + i + '\n'
+                case 3:
+                    ans = "正确" if tans == 1 else "错误"
+                case 0:
+                    ans = tans
+        else:
+            logger.error(f'{self.name}查询失败:\n{res.text}')
+            return None
 
-    def _clean_response(self, content):
-        """清洗模型返回内容，确保JSON格式正确"""
-        return content.strip().replace('```json', '').replace('```', '')
+        ret += str(ans)
 
-    def answer_question(self, full_question, image_url=None):
-        """
-        调用边缘网关答题（支持纯文本/图文问答）
-        :param full_question: 问题文本
-        :param image_url: 图片URL（多模态时传入，默认None为纯文本）
-        :return: 拼接后的答案字符串
-        """
-        # 1. 系统提示词（保持题库答题逻辑）
-        system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+        self._times -= 1
 
-        # 2. 控制请求频率，避免超限
+        # 10次查询后更新实际次数
+        self._count = (self._count + 1) % 10
+
+        if self._count == 0:
+            self.update_times()
+
+        return ret
+
+    def update_times(self):
+        res = requests.post(
+            self.balance_api,
+            json={
+                'token': self._token,
+            },
+            verify=False
+        )
+        if res.status_code == 200:
+            res_json = res.json()
+            self._times = res_json["data"].get("balance", self._times)
+            logger.info(f"当前LIKE知识库Token剩余查询次数为: {self._times}")
+        else:
+            logger.error('TOKEN出现错误，请检查后再试')
+
+    def load_token(self):
+        token = self._conf['tokens'].split(',')[-1] if ',' in self._conf['tokens'] else self._conf['tokens']
+        self._token = token
+
+    def load_config(self):
+        self._search = self._conf['likeapi_search']
+        self._model = self._conf['likeapi_model']
+        var_params = {"likeapi_search": self._search, "likeapi_model": self._model}
+        config_params = {"likeapi_search": False, "likeapi_model": None}
+
+        for k, v in config_params.items():
+            if k in self._conf:
+                var_params[k] = self._conf[k]
+            else:
+                var_params[k] = v
+
+    def _init_tiku(self):
+        self.load_token()
+        self.load_config()
+        self.update_times()
+
+
+class TikuAdapter(Tiku):
+    # TikuAdapter题库实现 https://github.com/DokiDoki1103/tikuAdapter
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'TikuAdapter题库'
+        self.api = ''
+
+    def _query(self, q_info: dict):
+        # 判断题目类型
+        if q_info['type'] == "single":
+            type = 0
+        elif q_info['type'] == 'multiple':
+            type = 1
+        elif q_info['type'] == 'completion':
+            type = 2
+        elif q_info['type'] == 'judgement':
+            type = 3
+        else:
+            type = 4
+
+        options = q_info['options']
+        res = requests.post(
+            self.api,
+            json={
+                'question': q_info['title'],
+                'options': [sub(r'^[A-Za-z]\.?、?\s?', '', option) for option in options.split('\n')],
+                'type': type
+            },
+            verify=False
+        )
+        if res.status_code == 200:
+            res_json = res.json()
+            # if bool(res_json['plat']):
+            # plat无论搜没搜到答案都返回0
+            # 这个参数是tikuadapter用来设定自定义的平台类型
+            if not len(res_json['answer']['bestAnswer']):
+                logger.error("查询失败, 返回：" + res.text)
+                return None
+            sep = "\n"
+            return sep.join(res_json['answer']['bestAnswer']).strip()
+        # else:
+        #   logger.error(f'{self.name}查询失败:\n{res.text}')
+        return None
+
+    def _init_tiku(self):
+        # self.load_token()
+        self.api = self._conf['url']
+
+
+class AI(Tiku):
+    # AI大模型答题实现
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'AI大模型答题'
+        self.last_request_time = None
+
+    def _query(self, q_info: dict):
+        def remove_md_json_wrapper(md_str):
+            # 使用正则表达式匹配Markdown代码块并提取内容
+            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
+            match = re.search(pattern, md_str, re.DOTALL)
+            return match.group(1).strip() if match else md_str.strip()
+
+        if self.http_proxy:
+            proxy = self.http_proxy
+            httpx_client = httpx.Client(proxy=proxy)
+            client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
+        else:
+            client = OpenAI(base_url=self.endpoint, api_key=self.key)
+        # 去除选项字母，防止大模型直接输出字母而非内容
+        options_list = q_info['options'].split('\n')
+        cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
+        options = "\n".join(cleaned_options)
+        # 判断题目类型
+        if q_info['type'] == "single":
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"题目：{q_info['title']}\n选项：{options}"
+                    }
+                ]
+            )
+        elif q_info['type'] == 'multiple':
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "本题为多选题，你必须选择两个或以上选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案1\",\n\"答案2\",\n\"答案3\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"题目：{q_info['title']}\n选项：{options}"
+                    }
+                ]
+            )
+        elif q_info['type'] == 'completion':
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "本题为填空题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"题目：{q_info['title']}"
+                    }
+                ]
+            )
+        elif q_info['type'] == 'judgement':
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "本题为判断题，你只能回答正确或者错误，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"题目：{q_info['title']}"
+                    }
+                ]
+            )
+        else:
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "本题为简答题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"这是我的答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"题目：{q_info['title']}"
+                    }
+                ]
+            )
+
+        try:
+            if self.last_request_time:
+                interval_time = time.time() - self.last_request_time
+                if interval_time < self.min_interval_seconds:
+                    sleep_time = self.min_interval_seconds - interval_time
+                    logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
+                    time.sleep(sleep_time)
+            self.last_request_time = time.time()
+            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            sep = "\n"
+            return sep.join(response['Answer']).strip()
+        except:
+            logger.error("无法解析大模型输出内容")
+            return None
+
+    def _init_tiku(self):
+        self.endpoint = self._conf['endpoint']
+        self.key = self._conf['key']
+        self.model = self._conf['model']
+        self.http_proxy = self._conf['http_proxy']
+        self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+
+
+class SiliconFlow(Tiku):
+    """硅基流动大模型答题实现"""
+
+    def __init__(self):
+        super().__init__()
+        self.name = '硅基流动大模型'
+        self.last_request_time = None
+
+    def _query(self, q_info: dict):
+        def remove_md_json_wrapper(md_str):
+            # 解析可能存在的JSON包装
+            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
+            match = re.search(pattern, md_str, re.DOTALL)
+            return match.group(1).strip() if match else md_str.strip()
+
+        # 构造请求头
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # 构造系统提示词
+        system_prompt = ""
+        if q_info['type'] == "single":
+            system_prompt = "本题为单选题，请根据题目和选项选择唯一正确答案，输出的是选项的具体内容，而不是内容前的ABCD，并以JSON格式输出：示例回答：{\"Answer\": [\"正确选项内容\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+        elif q_info['type'] == 'multiple':
+            system_prompt = "本题为多选题，请选择所有正确选项，输出的是选项的具体内容，而不是内容前的ABCD，以JSON格式输出：示例回答：{\"Answer\": [\"选项1\",\"选项2\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+        elif q_info['type'] == 'completion':
+            system_prompt = "本题为填空题，请直接给出填空内容，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+        elif q_info['type'] == 'judgement':
+            system_prompt = "本题为判断题，请回答'正确'或'错误'，以JSON格式输出：示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+
+        # 构造请求体
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"题目：{q_info['title']}\n选项：{q_info['options']}"
+                }
+            ],
+            "stream": False,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.7,
+            "response_format": {"type": "text"}
+        }
+
+        # 处理请求间隔
+        if self.last_request_time:
+            interval = time.time() - self.last_request_time
+            if interval < self.min_interval:
+                time.sleep(self.min_interval - interval)
+
+        try:
+            response = requests.post(
+                self.api_endpoint,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            self.last_request_time = time.time()
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content']
+                parsed = json.loads(remove_md_json_wrapper(content))
+                return "\n".join(parsed['Answer']).strip()
+            else:
+                logger.error(f"API请求失败：{response.status_code} {response.text}")
+                return None
+
+        except Exception as e:
+            logger.error(f"硅基流动API异常：{e}")
+            return None
+
+    def _init_tiku(self):
+        # 从配置文件读取参数
+        self.api_endpoint = self._conf.get('siliconflow_endpoint', 'https://api.siliconflow.cn/v1/chat/completions')
+        self.api_key = self._conf['siliconflow_key']
+        self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
+        self.min_interval = int(self._conf.get('min_interval_seconds', 3))
+
+
+# ------------------------ DeepSeek大模型题库类（替换原豆包类） ------------------------
+class Doubao(Tiku):
+    """DeepSeek大模型答题实现（适配DeepSeek-V3.2 API）"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'DeepSeek-V3.2（开放平台）'
+        self.last_request_time = None  # 记录最后一次请求时间，防止频率超限
+
+    def _query(self, q_info: dict):
+        """核心：调用DeepSeek API查询题目答案"""
+
+        # 工具函数：清理大模型输出的多余格式（比如```json包裹）
+        def clean_response(content):
+            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
+            match = re.search(pattern, content, re.DOTALL)
+            return match.group(1).strip() if match else content.strip()
+
+        # 1. 构造题目信息（类型+题干+选项）
+        q_type = q_info['type']  # single/multiple/completion/judgement
+        q_title = q_info['title']
+        q_options = q_info.get('options', '')  # 选项可能为空（如填空题）
+        full_question = f"题目：{q_title}\n选项：{q_options}" if q_options else f"题目：{q_title}"
+
+        # 2. 构造DeepSeek API的系统提示词（按题目类型定制）
+        system_prompt = ""
+        if q_type == "single":
+            system_prompt = "本题为单选题，仅选择一个正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回：{\"Answer\": [\"正确选项内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+        elif q_type == "multiple":
+            system_prompt = "本题为多选题，选择所有正确选项，直接输出选项的具体内容（不要ABCD字母），以JSON格式返回：{\"Answer\": [\"选项1\", \"选项2\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+        elif q_type == "completion":
+            system_prompt = "本题为填空题，直接给出正确答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+        elif q_type == "judgement":
+            system_prompt = "本题为判断题，仅回答“正确”或“错误”，以JSON格式返回：{\"Answer\": [\"正确\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+        else:
+            system_prompt = "本题为简答题，直接给出核心答案，以JSON格式返回：{\"Answer\": [\"答案内容\"]}。禁止输出任何多余解释、MD语法或参考资料。"
+
+        # 3. 构造DeepSeek API请求参数
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"  # DeepSeek的API Key
+        }
+        payload = {
+            "model": self.model,  # DeepSeek模型名：deepseek-chat/deepseek-reasoner
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": full_question}
+            ],
+            "temperature": 0.1,  # 低随机性，保证答案稳定
+            "max_tokens": 1024,
+            "stream": False  # 非流式输出
+        }
+
+        # 4. 处理请求频率限制（避免API超限）
         if self.last_request_time:
             interval = time.time() - self.last_request_time
             if interval < self.min_interval:
                 sleep_time = self.min_interval - interval
-                logger.debug(f"请求间隔过短，等待 {sleep_time:.2f} 秒")
+                logger.debug(f"DeepSeek API请求间隔过短，等待{sleep_time:.2f}秒")
                 time.sleep(sleep_time)
         self.last_request_time = time.time()
 
-        # 3. 构造消息体（支持纯文本/多模态）
-        messages = [{"role": "system", "content": system_prompt}]
-        user_content = []
-        
-        # 纯文本问题
-        user_content.append({"type": "text", "text": full_question})
-        # 多模态：添加图片URL（如有）
-        if image_url:
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": image_url}
-            })
-
-        messages.append({"role": "user", "content": user_content})
-
-        # 4. 调用边缘网关API
+        # 5. 调用DeepSeek API并解析结果
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,  # 低随机性保证答案稳定
-                max_tokens=self.max_tokens,
-                stream=False       # 非流式输出
+            response = requests.post(
+                url=self.api_endpoint,
+                headers=headers,
+                json=payload,
+                verify=False,
+                timeout=30
             )
+            response.raise_for_status()  # 抛出HTTP错误（如401、429）
+            res_json = response.json()
 
-            # 5. 解析返回结果
-            content = completion.choices[0].message.content
-            cleaned_content = self._clean_response(content)
+            # 解析返回的答案
+            content = res_json['choices'][0]['message']['content']
+            cleaned_content = clean_response(content)
             answer_json = json.loads(cleaned_content)
             answer_list = answer_json.get('Answer', [])
 
             if not answer_list:
-                logger.error("边缘网关返回的答案为空")
+                logger.error("DeepSeek返回的答案为空")
                 return None
 
-            final_answer = "\n".join(answer_list).strip()
-            # 若配置了自动提交，可在此处添加提交逻辑（根据你的业务需求扩展）
-            if self.submit:
-                logger.debug(f"自动提交答案：{final_answer}")
+            # 拼接答案（兼容原有逻辑的字符串格式）
+            return "\n".join(answer_list).strip()
 
-            return final_answer
-
+        except requests.exceptions.RequestException as e:
+            logger.error(f"DeepSeek API请求失败：{str(e)}，响应内容：{response.text if 'response' in locals() else '无'}")
+        except json.JSONDecodeError as e:
+            logger.error(f"DeepSeek返回内容解析失败：{str(e)}，原始内容：{content}")
         except Exception as e:
-            logger.error(f"答题失败：{str(e)}")
-            return None
+            logger.error(f"DeepSeek答题逻辑异常：{str(e)}")
 
-# -------------------------- 测试示例 --------------------------
-if __name__ == "__main__":
-    # 初始化题库对象
-    try:
-        tiku = DoubaoTiku(conf_path="config.ini")
-        
-        # 测试纯文本问答（替换为你的题库问题）
-        test_question = "请简述边缘大模型网关的核心作用"
-        test_answer = tiku.answer_question(test_question)
-        print(f"问题：{test_question}\n答案：{test_answer}\n")
+        return None
 
-        # 测试多模态图文问答（需替换为有效图片URL）
-        # img_question = "描述这张图片的内容"
-        # img_url = "https://example.com/your-image.jpg"
-        # img_answer = tiku.answer_question(img_question, image_url=img_url)
-        # print(f"图文问题：{img_question}\n答案：{img_answer}")
+    def _init_tiku(self):
+        """从config.ini加载DeepSeek配置"""
+        # 从[tiku]配置中读取参数（兼容原豆包配置项命名，仅语义替换）
+        self.api_endpoint = self._conf.get('doubao_endpoint',
+                                           'https://api.deepseek.com/v1/chat/completions')  # DeepSeek固定地址
+        self.api_key = self._conf['doubao_api_key']  # DeepSeek的API Key（配置项名保留，值替换为DeepSeek的Key）
+        self.model = self._conf.get('doubao_model', 'deepseek-chat')  # DeepSeek模型名（默认非思考模式）
+        self.min_interval = int(self._conf.get('doubao_min_interval', 1))  # 请求间隔（秒）
 
-    except Exception as e:
-        logger.error(f"初始化失败：{str(e)}")
+
+# 补充缺失的logger和answer_check模块（保证代码可运行）
+# 实际使用时请替换为项目中真实的logger和answer_check实现
+class logger:
+    @staticmethod
+    def info(msg):
+        print(f"[INFO] {msg}")
+
+    @staticmethod
+    def error(msg):
+        print(f"[ERROR] {msg}")
+
+    @staticmethod
+    def debug(msg):
+        print(f"[DEBUG] {msg}")
+
+
+def check_answer(answer, q_type, tiku):
+    """简化的答案校验逻辑（实际需根据业务调整）"""
+    if q_type == "judgement":
+        return answer in ["正确", "错误"]
+    return True if answer else False
