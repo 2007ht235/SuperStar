@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 from enum import Enum
 from hashlib import md5
-
+import random
+import time
+import re
+import logging
 import requests
 from requests.adapters import HTTPAdapter
+
+# 导入边缘网关题库类（需确保tiku.py和base.py在同一目录）
+from tiku import DoubaoTiku
 
 from api.answer import *
 from api.cipher import AESCipher
@@ -19,6 +25,8 @@ from api.decode import (
 from api.process import show_progress
 from api.exceptions import MaxRetryExceeded
 
+# 初始化日志
+logger = logging.getLogger(__name__)
 
 def get_timestamp():
     return str(int(time.time() * 1000))
@@ -69,10 +77,12 @@ class Chaoxing:
         def is_failure(result):
             return result != Chaoxing.StudyResult.SUCCESS
 
-    def __init__(self, account: Account = None, tiku: Tiku = None,**kwargs):
+    # 修复1：移除未定义的Tiku类型注解，改为兼容写法
+    def __init__(self, account: Account = None, tiku: DoubaoTiku = None,**kwargs):
         self.account = account
         self.cipher = AESCipher()
-        self.tiku = tiku
+        # 适配边缘网关题库类，若未传入则初始化默认实例
+        self.tiku = tiku if tiku else DoubaoTiku(conf_path="config.ini")
         self.kwargs = kwargs
         self.rollback_times = 0
 
@@ -91,7 +101,7 @@ class Chaoxing:
             "doubleFactorLogin": 0,
             "independentId": 0,
         }
-        logger.trace("正在尝试登录...")
+        logger.trace("正在尝试登录...") if hasattr(logger, 'trace') else logger.debug("正在尝试登录...")
         resp = _session.post(_url, headers=gc.HEADERS, data=_data)
         if resp and resp.json()["status"] == True:
             save_cookies(_session)
@@ -112,7 +122,7 @@ class Chaoxing:
         _session = init_session()
         _url = "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/courselistdata"
         _data = {"courseType": 1, "courseFolderId": 0, "query": "", "superstarClass": 0}
-        logger.trace("正在读取所有的课程列表...")
+        logger.trace("正在读取所有的课程列表...") if hasattr(logger, 'trace') else logger.debug("正在读取所有的课程列表...")
         # 接口突然抽风, 增加headers
         _headers = {
             "Host": "mooc2-ans.chaoxing.com",
@@ -152,7 +162,7 @@ class Chaoxing:
     def get_course_point(self, _courseid, _clazzid, _cpi):
         _session = init_session()
         _url = f"https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse?courseid={_courseid}&clazzid={_clazzid}&cpi={_cpi}&ut=s"
-        logger.trace("开始读取课程所有章节...")
+        logger.trace("开始读取课程所有章节...") if hasattr(logger, 'trace') else logger.debug("开始读取课程所有章节...")
         _resp = _session.get(_url)
         # logger.trace(f"原始章节列表内容:\n{_resp.text}")
         logger.info("课程章节读取成功...")
@@ -172,7 +182,7 @@ class Chaoxing:
             "6",
         ]:  # 学习界面任务卡片数, 很少有3个的, 但是对于章节解锁任务点少一个都不行, 可以从API /mooc-ans/mycourse/studentstudyAjax获取值, 或者干脆直接加, 但二者都会造成额外的请求
             _url = f"https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid={_clazzid}&courseid={_courseid}&knowledgeid={_knowledgeid}&num={_possible_num}&ut=s&cpi={_cpi}&v=20160407-3&mooc2=1"
-            logger.trace("开始读取章节所有任务点...")
+            logger.trace("开始读取章节所有任务点...") if hasattr(logger, 'trace') else logger.debug("开始读取章节所有任务点...")
             _resp = _session.get(_url)
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
@@ -240,6 +250,7 @@ class Chaoxing:
             # 若出现两个rt参数都返回403的情况, 则跳过当前任务
             logger.warning("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
             return {"isPassed": False}, 403  # 返回一个字典和当前状态
+
     def study_video(
         self, _course, _job, _job_info, _speed: float = 1.0, _type: str = "Video"
     ) -> StudyResult:
@@ -291,6 +302,7 @@ class Chaoxing:
             return self.StudyResult.SUCCESS
         else:
             return self.StudyResult.ERROR
+
     def study_document(self, _course, _job) -> StudyResult:
         """
         Study a document in Chaoxing platform.
@@ -324,7 +336,8 @@ class Chaoxing:
             return self.StudyResult.SUCCESS
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
-        if self.tiku.DISABLE or not self.tiku:
+        # 修复2：适配DoubaoTiku的DISABLE属性（若未定义则默认False）
+        if hasattr(self.tiku, 'DISABLE') and self.tiku.DISABLE or not self.tiku:
             return self.StudyResult.SUCCESS
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
@@ -384,8 +397,11 @@ class Chaoxing:
                 ]  # 取首字为答案, 例如A或B
             # 判断题处理
             elif q["type"] == "judgement":
-                # answer = self.tiku.jugement_select(_answer)
-                answer = "true" if random.choice([True, False]) else "false"
+                # 修复3：适配DoubaoTiku的judgement_select方法（若无则随机）
+                if hasattr(self.tiku, 'judgement_select'):
+                    answer = "true" if self.tiku.judgement_select(res) else "false"
+                else:
+                    answer = "true" if random.choice([True, False]) else "false"
             logger.info(f"随机选择 -> {answer}")
             return answer
 
@@ -541,7 +557,12 @@ class Chaoxing:
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay",0)
             time.sleep(query_delay)
-            res = self.tiku.query(q)
+            # 修复4：适配DoubaoTiku的query方法（原方法是answer_question，此处封装适配）
+            if hasattr(self.tiku, 'query'):
+                res = self.tiku.query(q)
+            else:
+                # 调用DoubaoTiku的answer_question方法，传入题目文本
+                res = self.tiku.answer_question(q["title"])
             answer = ""
             if not res:
                 # 随机答题
@@ -573,7 +594,11 @@ class Chaoxing:
                                 answer = o[:1]
                                 break
                 elif q["type"] == "judgement":
-                    answer = "true" if self.tiku.judgement_select(res) else "false"
+                    if hasattr(self.tiku, 'judgement_select'):
+                        answer = "true" if self.tiku.judgement_select(res) else "false"
+                    else:
+                        # 适配边缘网关返回的判断题答案
+                        answer = "true" if "正确" in res or "对" in res else "false"
                 elif q["type"] == "completion":
                     if isinstance(res,list):
                         answer = "".join(answer)
@@ -594,16 +619,19 @@ class Chaoxing:
             # 填充答案
             q["answerField"][f'answer{q["id"]}'] = answer
             logger.info(f'{q["title"]} 填写答案为 {answer}')
+        # 修复5：适配DoubaoTiku的COVER_RATE属性（从config.ini读取）
         cover_rate = (found_answers / total_questions) * 100
+        cover_rate_threshold = getattr(self.tiku, 'cover_rate', 0.8) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
-        if self.tiku.get_submit_params() == "1":
+        # 修复6：适配DoubaoTiku的get_submit_params方法
+        if hasattr(self.tiku, 'get_submit_params') and self.tiku.get_submit_params() == "1":
             questions["pyFlag"] = "1"
-        elif cover_rate >= self.tiku.COVER_RATE*100 or self.rollback_times >= 1:
+        elif cover_rate >= cover_rate_threshold or self.rollback_times >= 1:
             questions["pyFlag"] = ""
         else:
             questions["pyFlag"] = "1"
-            logger.info(f"章节检测题库覆盖率低于{self.tiku.COVER_RATE*100:.0f}%，不予提交")
+            logger.info(f"章节检测题库覆盖率低于{cover_rate_threshold:.0f}%，不予提交")
         # 组建提交表单
         if questions["pyFlag"] == "1":
             for q in questions["questions"]:
@@ -702,3 +730,38 @@ class Chaoxing:
         else:
             logger.info(f"空页面任务完成 -> {_chapterId['title']}")
             return self.StudyResult.SUCCESS
+
+# 补充缺失的cut函数（原代码中未定义，适配multi_cut逻辑）
+def cut(s):
+    """分割选项字符串，适配multi_cut"""
+    cut_char = [
+        "\n",
+        ",",
+        "，",
+        "|",
+        "\r",
+        "\t",
+        "#",
+        "*",
+        "-",
+        "_",
+        "+",
+        "@",
+        "~",
+        "/",
+        "\\",
+        ".",
+        "&",
+        " ",
+        "、",
+    ]
+    for char in cut_char:
+        if char in s:
+            parts = [p.strip() for p in s.split(char) if p.strip()]
+            if parts:
+                return parts
+    # 若没有分割符，按单个选项返回（如"A选项B选项"拆分为["A选项","B选项"]）
+    import re
+    pattern = re.compile(r'([A-Za-z][^A-Za-z]*)')
+    parts = [p.strip() for p in pattern.findall(s) if p.strip()]
+    return parts if parts else None
